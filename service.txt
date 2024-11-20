@@ -1,0 +1,800 @@
+import json
+import os
+import sys
+import re
+import shutil
+import PyPDF2
+import docx
+from langdetect import detect
+import sseclient
+import gradio as gr
+import requests
+import urllib3
+from pptx import Presentation
+
+current_w_dir = os.getcwd()
+root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.append(os.path.join(root_dir, "resources/text_generation_webui"))
+from resources.text_generation_webui.modules.logging_colors import logger
+from resources.text_generation_webui.modules import shared as shared
+
+# Javascript code is being used in this file.
+path = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(path, "save_files.js")) as f:
+    save_file_js = f.read()
+
+html_moderations_tooltip = """
+<style>
+.tooltip {
+    position: relative;
+    display: inline-block;
+    cursor: pointer;
+}
+
+.tooltip .tooltiptext {
+    visibility: hidden;
+    width: 500px;
+    background-color: #555;
+    color: #fff;
+    text-align: left;
+    border-radius: 6px;
+    padding: 5px;
+    position: absolute;
+    z-index: 1;
+    bottom: 125%;
+    left: 50%;
+    margin-left: -100px;
+    opacity: 0;
+    transition: opacity 0.3s;
+    max-height: 200px;
+    overflow-y: auto;
+}
+.tooltip:hover .tooltiptext {
+    visibility: visible;
+    opacity: 1;
+}
+</style>
+
+<div class="tooltip">(?) 
+    <div class="tooltiptext">Use moderations to prevent conversations in given topics.</div></div>
+"""
+html_moderations_tooltip_tr = """
+<style>
+.tooltip {
+    position: relative;
+    display: inline-block;
+    cursor: pointer;
+}
+
+.tooltip .tooltiptext {
+    visibility: hidden;
+    width: 500px;
+    background-color: #555;
+    color: #fff;
+    text-align: left;
+    border-radius: 6px;
+    padding: 5px;
+    position: absolute;
+    z-index: 1;
+    bottom: 125%;
+    left: 50%;
+    margin-left: -100px;
+    opacity: 0;
+    transition: opacity 0.3s;
+    max-height: 200px;
+    overflow-y: auto;
+}
+.tooltip:hover .tooltiptext {
+    visibility: visible;
+    opacity: 1;
+}
+</style>
+
+<div class="tooltip">(?) 
+    <div class="tooltiptext">Filtreleme kullanarak istenmeyen kategorilerdeki iletişimi önleyebilirsiniz.</div></div>
+"""
+html_vectordb_tooltip = """
+<style>
+.tooltip {
+    position: relative;
+    display: inline-block;
+    cursor: pointer;
+}
+
+.tooltip .tooltiptext {
+    visibility: hidden;
+    width: 200px;
+    background-color: #555;
+    color: #fff;
+    text-align: center;
+    border-radius: 6px;
+    padding: 5px;
+    position: absolute;
+    z-index: 1;
+    bottom: 125%;
+    left: 50%;
+    margin-left: -100px;
+    opacity: 0;
+    transition: opacity 0.3s;
+}
+.tooltip:hover .tooltiptext {
+    visibility: visible;
+    opacity: 1;
+}
+</style>
+
+<div class="tooltip">(?) 
+    <div class="tooltiptext">Inspect Documents enables IBThink to respond according to the data in the selected folder. Custom folders can be created as well.</div></div>
+"""
+html_vectordb_tooltip_tr = """
+<style>
+.tooltip {
+    position: relative;
+    display: inline-block;
+    cursor: pointer;
+}
+
+.tooltip .tooltiptext {
+    visibility: hidden;
+    width: 200px;
+    background-color: #555;
+    color: #fff;
+    text-align: center;
+    border-radius: 6px;
+    padding: 5px;
+    position: absolute;
+    z-index: 1;
+    bottom: 125%;
+    left: 50%;
+    margin-left: -100px;
+    opacity: 0;
+    transition: opacity 0.3s;
+}
+.tooltip:hover .tooltiptext {
+    visibility: visible;
+    opacity: 1;
+}
+</style>
+
+<div class="tooltip">(?) 
+    <div class="tooltiptext">Döküman İncele sayesinde IBThink, seçilen dosyadaki verileri değerlendirerek cevap verir. Yeni dosyalar da oluşturabilirsiniz.</div></div>
+"""
+
+# Environment variables
+endpoint = os.environ.get('endpoint')
+bucket_name = os.environ.get('bucket_name')
+access_key = os.environ.get('user')
+secret_key = os.environ.get('pass')
+local_path = os.environ.get('local_path')  # save folder on openshift
+remote_path = os.environ.get('remote_path')
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # hide HTTPS warning
+
+my_api_key = os.environ.get('api_key')
+my_flask_key = os.environ.get('flask_key')
+headers = {"Authorization": f"Bearer {my_api_key}"}
+url = "http://127.0.0.1:5001/v1/moderations"
+urlchat = "http://127.0.0.1:5001/v1/chat/completions"
+add_db_url = "http://127.0.0.1:5002/api/v1/add"
+delete_db_url = "http://127.0.0.1:5002/api/v1/delete"
+send_db_url = "http://127.0.0.1:5002/api/v1/get"
+
+# Global variables are used when gradio objects were not enough
+moderation_display = ""
+chunks_display = ""
+stream = True
+moderation_block_list = []
+unsupportedfilelist = []
+unsupportedtxtlist = []
+there_is_no_supported_file = True
+text_dict = {
+    "Scores from Moderations: \n": "Filtreleme Skorları: \n",
+    "Folder deleted successfully": "Klasör başarıyla silindi.",
+    "This folder is not deletable.": "Bu klasör silinemez.",
+    "Only UTF-8 encoding is supported for .txt files, .txt files with other encodings are ignored: ": "Sadece UTF-8 encoded .txt dosyaları desteklenmektedir, diğer .txt dosyaları görmezden gelindi: ",
+    "Unsupported file(s) are detected and ignored: ": "Desteklenmeyen dosya(lar) tespit edildi ve görmezden gelindi: ",
+    ". You can select the folder from dropdown menu.": ". Klasörünüzü listeden seçebilirsiniz.",
+    "Folder created successfully. You can select the folder from dropdown menu.": "Klasörünüz başarıyla oluşturuldu. Klasörünüzü listeden seçebilirsiniz.",
+    "An error occurred while creating the folder. Please try again.": "Klasör oluşturulurken bir hata oluştu. Lütfen tekrar deneyin.",
+    "Please name your folder to create.": "Lütfen klasörünüze bir isim verin.",
+    "Please name your folder differently.": "Lütfen klasörünüzü farklı isimlendirin.",
+    "There is no supported file in chosen files, folder cannot be created.": "Seçilen dosyaların hiçbiri desteklenmediğinden klasörünüz oluşturulamadı.",
+    "Creating...": "Oluşturuluyor...",
+    "View Button does not display files for 'All' option.": "İncele Butonu, 'All' seçeneği için dosyaları görüntülemez",
+    "Files in the selected folder as follows: \n": "Seçilen klasörün içindeki dosyalar: \n",
+    "Chat file should be in JSON format.": "Sohbet dosyası JSON formatında olmalıdır.",
+    "Chat file could not be loaded.": "Sohbet dosyası yüklenemedi.",
+    "File and Folder Name of Documents: \n": "Dökümanların Dosya ve Klasör Adı: \n",
+    "\n\nChunks from Documents: \n": "\n\nDökümanlardan getirilen bilgiler: \n",
+    "Parameters": "Parametreler",
+    "Moderations": "Filtreleme",
+    "Save Chat": "Sohbeti Kaydet",
+    "Load Chat": "Sohbet Yükle",
+    "Inspect Documents": "Döküman İncele",
+    "Extra Information": "Ekstra Bilgiler",
+    "Information about moderations and documents will be displayed here.": "Filtreleme ve Döküman İncelemesine yönelik ekstra bilgiler burada görüntülenecektir.",
+    "Retry": "Tekrar Gönder",
+    "Undo": "Geri Al",
+    "Clear": "Temizle",
+    "EN|TR": "TR|EN",
+    "Submit": "Gönder",
+    "Stop": "Dur",
+    "Type a message...": "Bir mesaj yaz...",
+    "Moderation": "Filtreleme",
+    "Moderation Categories": "Filtreleme Kategorileri",
+    "Moderation Categories (Write in the form of: Violence, Hate...)": "Filtreleme Kategorileri (Lütfen belirtilen formda yaz: Şiddet, Nefret...)",
+    "Moderation Threshold": "Filtreleme Eşiği",
+    "Use moderations to prevent conversations in given topics.": "Filtreleme kullanarak istenmeyen kategorilerdeki iletişimi önleyebilirsiniz.",
+    "Use Once": "Bir Kez",
+    "Use Always": "Her Zaman",
+    "Select Folder": "Dosya Seç",
+    "New Folder Name": "Yeni Dosya İsmi",
+    "Name your own folder to create.": "Oluşturacağınız dosyayı isimlendirin.",
+    "Create": "Oluştur",
+    "View": "İncele",
+    "Delete": "Sil",
+    html_moderations_tooltip: html_moderations_tooltip_tr,
+    html_vectordb_tooltip: html_vectordb_tooltip_tr
+}
+
+
+def f_convert_lang(text, lang):
+    try:
+        if lang == "TR|EN":  # find dict value from key
+            return text_dict.get(text, text)
+        else:
+            return text
+            # return list(text_dict.keys())[list(text_dict.values()).index(text)]
+    except:
+        return text
+
+
+def log_IP(text, request: gr.Request):
+    if request:
+        real_ip = f'{request.kwargs["headers"].get("x-forwarded-for")}' if request.kwargs["headers"].get("x-forwarded-for") else f'{request.client.host}'
+        logger.info(f"UI request from {str(real_ip)}")
+
+
+def moderations(user_input, categories, threshold, language):
+    if categories is not None:
+        categories = [item.strip() for item in categories.split(',')]
+
+    json_data = {
+        "input": user_input,
+        "categories": categories,
+        "flag_threshold": threshold,
+        "moderations_disabled": False
+    }
+    response = requests.post(url, json=json_data, headers=headers, verify=False)
+    answer = response.json()
+    global moderation_display
+    moderation_display = answer['results'][0]['category_scores']
+    formatted_data = json.dumps(moderation_display, indent=4, ensure_ascii=False)
+    moderation_display = f_convert_lang("Scores from Moderations: \n", language) + str(formatted_data)
+    true_or_false = answer['results'][0]['flagged']
+    return true_or_false
+
+
+def stop_generation():
+    shared.stop_everything = True
+
+
+def delete_vectordb(directoryname, language, silent=False):
+    try:
+        shutil.rmtree(f"{local_path}models/ingest_user/{directoryname}")
+
+        json_data = {
+            "key": my_flask_key,
+            "metadata": {
+                "folder": f"{directoryname}"
+            }
+        }
+        response = requests.post(url=delete_db_url, json=json_data, verify=False)
+        if not silent:
+            gr.Info(f_convert_lang("Folder deleted successfully", language))
+    except:
+        gr.Warning(f_convert_lang("This folder is not deletable.", language))
+
+
+def update_dropdown(dropdown_value="All"):
+    folder_list = refresh()
+    if dropdown_value not in folder_list:
+        dropdown_value = "All"
+    vectordb = gr.Dropdown([i for i in folder_list], value=dropdown_value, label="Select Folder", min_width=270,
+                           show_label=True, allow_custom_value=False)
+    return vectordb
+
+
+def refresh():
+    list_one = os.listdir(f"{local_path}models/ingest/")
+    list_two = os.listdir(f"{local_path}models/ingest_user/")
+    all = list(["All"])
+    liste = all + list_one + list_two
+    return liste
+
+
+def db_add_request(directoryname, language):
+    try:
+        global unsupportedtxtlist
+        global unsupportedfilelist
+        global there_is_no_supported_file
+        if there_is_no_supported_file:
+            return  # If there is no supported file, it does not send a request to the database.
+        files = os.listdir(f"{local_path}models/ingest_user/{directoryname}")
+        logger.info(f"Uploading {directoryname} with {len(files)} files")
+        for file in files:
+            filepath = f"{local_path}models/ingest_user/{directoryname}/{file}"
+            with open(filepath, 'r', encoding="utf-8") as f:
+                contents = f.read()
+
+            json_data = {
+                "key": my_flask_key,
+                "clear_before_adding": False,
+                "metadata": {
+                    "source": file,
+                    "folder": directoryname
+                },
+                "corpus": contents
+            }
+
+            response = requests.post(add_db_url, json=json_data, verify=False)
+            if response.status_code != 200:
+                raise Exception("Failed to add file to the database.")
+
+        if len(unsupportedtxtlist) != 0:
+            gr.Warning(f"{f_convert_lang('Only UTF-8 encoding is supported for.txt files, .txt files with other encodings are ignored: ', language)}{unsupportedtxtlist}")
+        if len(unsupportedfilelist) != 0:
+            gr.Warning(f"{f_convert_lang('Unsupported file(s) are detected and ignored: ', language)}{unsupportedfilelist}{f_convert_lang('. You can select the folder from dropdown menu.', language)}")
+        elif len(unsupportedtxtlist) == 0:  # if both are empty
+            gr.Info(f_convert_lang("Folder created successfully. You can select the folder from dropdown menu.", language))
+    except Exception as e:
+        gr.Warning(f_convert_lang("An error occurred while creating the folder. Please try again.", language))
+        logger.error(e)
+
+
+def read_pdf(file_path):
+    content = []
+    with open(file_path, 'rb') as file:
+        reader = PyPDF2.PdfReader(file)
+        for page_num in range(len(reader.pages)):
+            page = reader.pages[page_num]
+            content.append(page.extract_text())
+    return "\n".join(content)
+
+
+def read_word(file_path):
+    doc = docx.Document(file_path)
+    content = []
+    for para in doc.paragraphs:
+        content.append(para.text)
+    return "\n".join(content)
+
+
+def moderations_tooltip_html():
+    return html_moderations_tooltip
+
+
+def vectordb_tooltip_html():
+    return html_vectordb_tooltip
+
+
+def upload_and_save_file(files, directoryname, language):
+    global unsupportedtxtlist
+    global unsupportedfilelist
+    global there_is_no_supported_file
+    unsupportedfilelist = []
+    unsupportedtxtlist = []
+    there_is_no_supported_file = True
+    directoryname = directoryname.replace(" ", "_")
+    if not re.search('[a-zA-Z]', directoryname):
+        gr.Warning(f_convert_lang("Please name your folder to create.", language))
+    else:
+        controlled_directory = f"{local_path}models/ingest/{directoryname}"
+        if directoryname.lower() == "all" or os.path.exists(controlled_directory):
+            gr.Warning(f_convert_lang("Please name your folder differently.", language))
+        else:
+            target_directory = f"{local_path}models/ingest_user/{directoryname}"
+            if os.path.exists(target_directory):
+                delete_vectordb(directoryname, language, silent=True)
+            os.makedirs(target_directory)
+            for file in files:
+                try:
+                    if file.name.endswith(".txt") or file.name.endswith(".pdf") or file.name.endswith(".docx") or file.name.endswith(".pptx"):
+                        if file.name.endswith(".txt"):
+                            with open(file.name, 'r', encoding="utf-8") as f:
+                                contents = f.read()
+                        elif file.name.endswith(".pdf"):
+                            contents = read_pdf(file.name)
+                        elif file.name.endswith(".docx"):
+                            contents = read_word(file.name)
+                        filename = os.path.basename(file.name)
+                        if not filename.endswith(".txt"):
+                            filename = filename + ".txt"
+                        target_file_path = os.path.join(target_directory, filename).replace(" ","_")
+                        if not file.name.endswith(".pptx"):
+                            with open(target_file_path, "w", encoding="utf-8") as f:
+                                f.write(contents)
+                        else:
+                            ppt = Presentation(file.name)
+                            with open(target_file_path, "w", encoding="utf-8") as file_to_write_pptx_data:
+                                for slide in ppt.slides:
+                                    for shape in slide.shapes:
+                                        if not shape.has_text_frame:
+                                            continue
+                                        for paragraph in shape.text_frame.paragraphs:
+                                            for run in paragraph.runs:
+                                                file_to_write_pptx_data.write(run.text)
+                        there_is_no_supported_file = False
+                    else:
+                        unsupportedfilelist.append(str(os.path.basename(file.name)))
+                        logger.info(f"Unsupported file: {str(os.path.basename(file.name))}")
+
+                except UnicodeDecodeError:
+                    unsupportedtxtlist.append(str(os.path.basename(file.name)))
+                    logger.info(f"Non utf-8 txt: {str(os.path.basename(file.name))}")
+                except Exception:
+                    unsupportedfilelist.append(str(os.path.basename(file.name)))
+                    logger.info(f"This file might be corrupted: {str(os.path.basename(file.name))}")
+            if there_is_no_supported_file:
+                os.rmdir(target_directory)
+                gr.Warning(f_convert_lang("There is no supported file in chosen files, folder cannot be created.", language))
+            else:
+                gr.Info(f_convert_lang("Creating...", language))
+
+
+def viewrag(directoryname, language):
+    if directoryname == "All":
+        return f_convert_lang("View Button does not display files for 'All' option.", language)
+    else:
+        try:
+            ragtexts = os.listdir(f"{local_path}models/ingest_user/{directoryname}")
+        except:
+            ragtexts = os.listdir(f"{local_path}models/ingest/{directoryname}")
+        content = ""
+        for i in ragtexts:
+            content += i + "\n"
+        content = f_convert_lang("Files in the selected folder as follows: \n", language) + content
+        global chunks_display
+        chunks_display = content
+        global moderation_display
+        moderation_display = ""
+        return content
+
+
+def load(file, chatbot_history, language):
+    try:
+        if file.name.endswith(".json"):
+            with open(file.name, 'r', encoding="utf-8") as f:
+                chatbot_history = json.load(f)
+        else:
+            gr.Warning(f_convert_lang("Chat file should be in JSON format.", language))
+    except Exception as e:
+        logger.info("Error loading chat file:", e)
+        gr.Warning(f_convert_lang("Chat file could not be loaded.", language))
+    return chatbot_history, chatbot_history
+
+
+def rag_text_print():
+    global chunks_display
+    global moderation_display
+    sep = "" if chunks_display == "" or moderation_display == "" else "\n\n"
+    informations = moderation_display + sep + chunks_display
+    return informations
+
+
+def message_formatter(memo, sys_prompt, message=""):
+    msg = [{"role": "system", "content": sys_prompt}]
+    if message == "":
+        for i in range(len(memo)):
+            msg.append({"role": "user", "content": memo[i][0]})
+            msg.append({"role": "assistant", "content": memo[i][1]})
+        return msg
+    if len(memo) == 0:
+        msg.append({"role": "user", "content": message})
+    else:
+        for i in range(len(memo)):
+            msg.append({"role": "user", "content": memo[i][0]})
+            msg.append({"role": "assistant", "content": memo[i][1]})
+        msg.append({"role": "user", "content": message})
+    return msg
+
+
+def send_db(message, selected_vectordb, max_chunk_count):
+    json_data = {
+        "key": my_api_key,
+        "search_strings": [message],
+        "folder": [selected_vectordb],
+        "max_chunk_count": max_chunk_count,
+    }
+    response = requests.post(url=send_db_url, json=json_data, verify=False)
+    chunk = response.json()
+    return chunk
+
+
+def send_to_pipeline(message, memo, system_prompt, character_preset, max_new_tokens, temperature, max_chunk_count, vectordb,
+                     usedb_once, usedb_always, extra_info_textbox, moderation_usage, moderation_categories, moderation_threshold, language):
+    global chunks_display
+    global moderation_display
+
+    go_to_llm = True    # If moderation request returns True, LLM is not being triggered.
+    if moderation_usage:
+        if not re.search('[a-zA-Z]', moderation_categories):  # If moderation categories do not contain any letter, sends None instead.
+            moderation_categories = None
+        if "True" in str(moderations(message, moderation_categories, moderation_threshold, language)):
+            go_to_llm = False
+            moderation_block_list.append(True)
+    else:
+        moderation_display = ""
+    if go_to_llm:
+        moderation_block_list.append(False)
+        if usedb_once or message.startswith("!c ") or usedb_always:
+            if message.startswith("!c "):
+                message = message[3:]  # "!c "
+
+            chunk_object = send_db(message, vectordb, max_chunk_count)
+            chunks = chunk_object['results']
+            metadata = chunk_object['metadata']
+            metadatastr = "[\n"
+            chunkstr = "[\n"
+            docstr = ""
+            for i in metadata:
+                metadatastr += f"{i}\n"
+            metadatastr += f"]"
+            for i in chunks:
+                chunkstr += f"[{i}]\n"
+                docstr += f"<<document chunk>>\n\n{i}\n\n"
+            chunkstr += f"]"
+            docstr += "<<document end>>" if docstr != "" else "<<document chunk>>\n\n<<document end>>"
+            disp_text = 'File and Folder Name of Documents: \n'
+            disp_text2 = '\n\nChunks from Documents: \n'
+            chunks_display = f"{f_convert_lang(disp_text, language)}{metadatastr}{f_convert_lang(disp_text2, language)}{chunkstr}"
+            message = f"{docstr}{message}"
+            system_prompt += """ Kullanıcı soru sormuş ise soruyu cevaplamak için aşağıdaki dökümanları kullanın. 
+Dökümanda yazan bütün bilgileri anlatmayın, sadece soruya cevap verin. 
+Cevabı bilmiyorsanız bilmediğinizi söyleyin, cevap uydurmayın. 
+Verilen bilgiler soruyla ilgili değilse cevap olarak sadece bu cümleyi söyleyin: "İlgili bilgiyi bulamadım". 
+Eğer soru sorulmamışsa konuşmaya uygun şekilde devam edin."""
+        else:
+            chunks_display = ""
+        formatted_memo = []
+        for situation, conversation in zip(moderation_block_list, memo):      # If any moderation request response is True for any user message, that user message
+            if not situation:                                                 # is not being sent to the LLM in memory. preventing unwanted messages.
+                formatted_memo.append(conversation)
+        msg = message_formatter(formatted_memo, system_prompt, message)
+        json_data = {
+            "preset": character_preset,
+            "character": character_preset,
+            "max_tokens": max_new_tokens,
+            "temperature": temperature,
+            "stream": stream,
+            "messages": msg
+        }
+        headers = {'Content-type': 'application/json',
+                   'Accept': 'application/json',
+                   "Authorization": f"Bearer {my_api_key}"}
+        response = requests.post(urlchat, json=json_data, headers=headers, stream=stream, verify=False)
+        client = sseclient.SSEClient(response)
+        memory_update = ""
+        try:
+            for event in client.events():
+                result = json.loads(event.data)
+                memory_update += (result['choices'][0]["message"]['content'])
+                yield memory_update
+        except:
+            pass
+    else:
+        language_of_user_message = detect(message)
+        if language_of_user_message == 'tr':
+            yield "Mesajınız moderations kategorilerine uymadığı için cevap veremiyorum."
+        else:
+            yield "I cannot respond to your message because it does not comply with the moderations categories."
+
+
+def vote(data: gr.LikeData):
+    if data.liked:
+        logger.info("Upvoted: " + data.value.replace("\r", "").replace("\n", " ~ "))
+    else:
+        logger.info("Downvoted: " + data.value.replace("\r", "").replace("\n", " ~ "))
+
+
+def image_with_link():
+    html_code = """
+    <html>
+    <head>
+    <body>
+    <a href="https://sdlc.ibtech.com.tr:444/confluence/display/SMG/LLM+How+To"
+    target="_blank">
+        <img src="file/confluence.png"
+        alt="Clickable Image" width="120" height="80">
+        </a>
+        </body>
+        </html>
+    """
+    return html_code
+
+
+def toggle_interactivity(checked):
+    return gr.update(interactive=checked), gr.update(interactive=checked)
+
+
+def reset_checkbox(once):
+    if once == 1:
+        return gr.Checkbox(value=False)
+    else:
+        return gr.Checkbox()
+
+
+def change_language(current_lang):
+    next_lang = "EN|TR" if current_lang == "TR|EN" else "TR|EN"
+    return (gr.update(label=f_convert_lang("Parameters", next_lang)), gr.update(label=f_convert_lang("Moderations", next_lang)),
+            gr.update(value=f_convert_lang("Save Chat", next_lang)), gr.update(label=f_convert_lang("Load Chat", next_lang)),
+            gr.update(label=f_convert_lang("Inspect Documents", next_lang)), gr.update(label=f_convert_lang("Extra Information", next_lang),
+            placeholder=f_convert_lang("Information about moderations and documents will be displayed here.", next_lang)), gr.update(
+            value=f_convert_lang("Retry", next_lang)), gr.update(value=f_convert_lang("Undo", next_lang)), gr.update(
+            value=f_convert_lang("Clear", next_lang)), gr.update(value=f_convert_lang("EN|TR", next_lang)), gr.update(
+            value=f_convert_lang("Submit", next_lang)), gr.update(value=f_convert_lang("Stop", next_lang)), gr.update(
+            placeholder=f_convert_lang("Type a message...", next_lang)), gr.update(label=f_convert_lang("Moderation", next_lang)),
+            gr.update(placeholder=f_convert_lang("Moderation Categories", next_lang), label=f_convert_lang("Moderation Categories (Write in the form of: Violence, Hate...)", next_lang)),
+            gr.update(label=f_convert_lang("Moderation Threshold", next_lang)), gr.update(value=f_convert_lang(html_moderations_tooltip, next_lang)),
+            gr.update(label=f_convert_lang("Use Once", next_lang)), gr.update(label=f_convert_lang("Use Always", next_lang)),
+            gr.update(label=f_convert_lang("Select Folder", next_lang)), gr.update(label=f_convert_lang("New Folder Name", next_lang),
+            placeholder=f_convert_lang("Name your own folder to create.", next_lang)), gr.update(label=f_convert_lang("Create", next_lang)),
+            gr.update(value=f_convert_lang("View", next_lang)), gr.update(value=f_convert_lang("Delete", next_lang)), gr.update(value=f_convert_lang(html_vectordb_tooltip, next_lang)))
+
+
+css = """
+.gradio-container {padding: 4px !important;
+scrollbar-color: grey #d3d3d32e !important; }
+#component-7 {gap: 0px !important}
+.custom-confluence {position: absolute; width:130px; top: 50%; left: 57%; -ms-transform: translate(-50%, -40%); transform: translate(-50%, -40%); padding: 10px;}
+.bubble-wrap {scrollbar-width: thin !important;}
+#extra_info_textbox textarea {-webkit-text-fill-color: #b4b4b4}
+footer{display:none !important}
+#submit_btn, stop_btn { max-height: 9vh;}
+#lang_button {
+    background-image: url('no_file_here_but_needed_for_transparent_button.png');
+    background-size: cover;
+    height:50px;
+    width:50px;
+    border: none;
+    cursor: pointer; 
+    position: absolute;
+    top: 50%; left: 92%;
+    -ms-transform: translate(-50%, -40%);
+    transform: translate(-50%, -40%); padding: 15px;
+    }
+#right_panel {
+    height: 90vh;
+    overflow: auto;
+    scrollbar-width: thin !important;
+}
+#chatbot { flex-grow: 1; overflow: auto;}
+#left-aligned-image {display: flex; justify-content: flex-start;}
+#textbox textarea {
+    overflow: auto !important;
+}
+"""
+
+chatbot = gr.Chatbot(show_copy_button=True, elem_id="chatbot")
+textbox = gr.Textbox(
+    label="Message",
+    placeholder="Type a message...",
+    scale=7,
+    autofocus=True,
+    elem_id="textbox",
+    autoscroll=True
+)
+submit_btn = gr.Button(
+    "Send",
+    variant="primary",
+    scale=1,
+    min_width=150,
+    elem_id="submit_btn",
+)
+stop_btn = gr.Button(
+    "Stop",
+    variant="stop",
+    visible=False,
+    scale=1,
+    min_width=150,
+    elem_id="stop_btn",
+)
+clear_btn = gr.Button("Clear",
+    elem_id="clear_btn",)
+undo_btn = gr.Button("Undo",
+    elem_id="undo_btn",)
+retry_btn = gr.Button("Retry",
+    elem_id="retry_btn",)
+with gr.Blocks(title="IBThink", analytics_enabled=False, css=css, elem_id="main_block") as demo:
+    with gr.Row():
+        with gr.Column(elem_id="header", scale=100) as header:
+            with gr.Row():
+                gr.Markdown("""<span style="font-size: 28px;">
+                        <span style="color: green;">IBT</span>hink  |  SMG<span style="color: purple;">AI</span> </span>
+                        """, elem_id="title")
+        with gr.Column():
+            gr.HTML(value=image_with_link, elem_classes="custom-confluence")
+            lang_btn = gr.Button("EN|TR", size="sm", min_width=50, elem_id="lang_button")
+
+    with gr.Row(equal_height=False, elem_id="main_row") as main:
+        with gr.Column(scale=6, variant="panel", elem_id="left_panel") as left:
+            with gr.Accordion("Parameters", open=False, elem_id="params") as param_tab:
+                system_prompt = gr.Textbox("Yapay zeka Türkçe konuşur.", label="System Prompt", show_label=True,
+                                           elem_id="system_prompt")
+                character_preset = gr.Dropdown(["CreativeAI", "InformativeAI", "InformativeAI-TR"],
+                                               value="InformativeAI-TR", label="Character", show_label=True,
+                                               elem_id="character_preset")
+                temperature = gr.Slider(0, 1, value=0.1, step=0.1, label="Temperature", show_label=True,
+                                        elem_id="temperature")
+                max_new_tokens = gr.Slider(1, 4096, value=1024, step=1, label="Max New Tokens", show_label=True,
+                                           elem_id="max_new_tokens")
+                max_chunk_count = gr.Slider(1, 4, value=2, step=1, label="Max Chunk Count", show_label=True,
+                                        elem_id="max_chunk_count")
+
+            with gr.Accordion("Moderations", open=False) as param_tab_2:
+                with gr.Row():
+                    moderation_usage = gr.Checkbox(label="Moderation", show_label=True, min_width=270, scale=4)
+                    moderation_tooltip = gr.HTML(value=moderations_tooltip_html)
+                moderation_categories = gr.Textbox("", placeholder="Moderation Categories",
+                                                   label="Moderation Categories (Write in the form of: Violence, Hate)",
+                                                   show_label=True, interactive=False)
+                moderation_threshold = gr.Slider(0, 1, value=0.5, step=0.05, label="Moderation Threshold",
+                                                 show_label=True, interactive=False)
+            with gr.Row(elem_id="history") as history:
+                history_save = gr.Button("Save Chat", scale=1)
+                history_load = gr.UploadButton("Load Chat", scale=1, file_count="single")
+            with gr.Accordion("Inspect Documents", open=False) as param_tab_3:
+                with gr.Row(elem_id="vecdb1") as vecdb1:
+                    usedb_once = gr.Checkbox(label="Use Once", show_label=True, scale=5, min_width=100,
+                                        elem_id="usedb_once")
+                    usedb_always = gr.Checkbox(label="Use Always", show_label=True, scale=5, min_width=100,
+                                        elem_id="usedb_always")
+                    vectordb_tooltip = gr.HTML(value=vectordb_tooltip_html)
+                with gr.Row(elem_id="vecdb") as vecdb2:
+                    vectordb = update_dropdown()
+                with gr.Column(elem_id="vecdb3") as vecdb3:
+                    name_of_db = gr.Textbox("", placeholder="Name your own folder to create.", label="New Folder Name",
+                                            show_label=True, interactive=True)
+                    adddb = gr.UploadButton("Create", file_count="multiple")
+
+                with gr.Row(elem_id="vecdb2") as vecdb:
+                    viewdb = gr.Button("View", scale=1, min_width=120, elem_id="viewdb")
+                    deletedb = gr.Button("Delete", scale=1, min_width=120, elem_id="deletedb")
+            extra_info_textbox = gr.Textbox("", placeholder="Information about moderations and documents will be displayed here.", label="Extra Information",
+                                            show_label=True, show_copy_button=True, interactive=False, elem_id="extra_info_textbox", autoscroll=False)
+
+        with gr.Column(scale=16, elem_id="right_panel") as right:
+            interface = gr.ChatInterface(
+                send_to_pipeline,
+                submit_btn=submit_btn,
+                textbox=textbox,
+                stop_btn=stop_btn,
+                chatbot=chatbot,
+                retry_btn=retry_btn,
+                clear_btn=clear_btn,
+                undo_btn=undo_btn,
+                analytics_enabled=False,
+                additional_inputs=[system_prompt, character_preset, max_new_tokens, temperature, max_chunk_count, vectordb,
+                                   usedb_once, usedb_always, extra_info_textbox, moderation_usage, moderation_categories, moderation_threshold, lang_btn]
+            )
+
+    chatbot.like(vote, None, None)
+    lang_btn.click(fn=change_language, inputs=lang_btn, outputs=[param_tab, param_tab_2, history_save, history_load, param_tab_3, extra_info_textbox, retry_btn, undo_btn, clear_btn, lang_btn, submit_btn, stop_btn, textbox, moderation_usage, moderation_categories, moderation_threshold, moderation_tooltip, usedb_once, usedb_always, vectordb, name_of_db, adddb, viewdb, deletedb, vectordb_tooltip])
+    adddb.upload(fn=upload_and_save_file, inputs=[adddb, name_of_db, lang_btn]).success(fn=db_add_request, inputs=[name_of_db, lang_btn]).then(fn=update_dropdown, inputs=name_of_db, outputs=vectordb)
+    moderation_usage.change(toggle_interactivity, moderation_usage, [moderation_categories, moderation_threshold])
+    chatbot.change(reset_checkbox, [usedb_once], [usedb_once], show_progress="hidden")
+    chatbot.change(rag_text_print, None, extra_info_textbox, show_progress="hidden")
+    stop_btn.click(stop_generation, None, None, queue=False)
+    gr.on([textbox.submit, submit_btn.click, clear_btn.click, undo_btn.click, retry_btn.click], None, chatbot, None, _js=f'(state) => {{{save_file_js}; set_webcache(state)}}')
+    gr.on([textbox.submit, submit_btn.click, retry_btn.click], log_IP, textbox, None)
+    history_save.click(None, chatbot, None, _js=f'(state) => {{{save_file_js}; downloadHistory(state)}}')
+    history_load.upload(fn=load, inputs=[history_load, interface.chatbot_state, lang_btn], outputs=[chatbot, interface.chatbot_state])
+    deletedb.click(fn=delete_vectordb, inputs=[vectordb, lang_btn]).then(fn=update_dropdown, outputs=vectordb)
+    viewdb.click(fn=viewrag, inputs=[vectordb, lang_btn], outputs=extra_info_textbox)
+    demo.load(fn=update_dropdown, outputs=vectordb)
+    demo.load(None, [chatbot], [chatbot, interface.chatbot_state], _js=f'(x) => {{{save_file_js}; get_webcache(x)}}')
+
+if __name__ == "__main__":
+    demo.queue(concurrency_count=64).launch(
+        server_name='0.0.0.0',
+        server_port=5004,
+        ssl_verify=False)
